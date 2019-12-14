@@ -11,6 +11,7 @@ func packBootBall(config string) (err error) {
 	if err != nil {
 		return
 	}
+	defer ball.Clean()
 	err = ball.Pack()
 	if err != nil {
 		return
@@ -25,6 +26,7 @@ func addSignatureToBootBall(bootBall, privKey, cert string) (err error) {
 	if err != nil {
 		return
 	}
+	defer ball.Clean()
 	err = ball.Sign(privKey, cert)
 	if err != nil {
 		return
@@ -37,6 +39,7 @@ func unpackBootBall(bootBall string) (err error) {
 	if err != nil {
 		return err
 	}
+	defer ball.Clean()
 	log.Println("Archive unpacked into: " + ball.Dir())
 	return nil
 }
