@@ -10,10 +10,11 @@ import (
 	"log"
 	"os"
 	"path"
-	"syscall"
+	"path/filepath"
 
-	"github.com/u-root/u-root/pkg/bootconfig"
-	"github.com/u-root/u-root/pkg/storage"
+	"github.com/u-root/u-root/pkg/boot/jsonboot"
+	"github.com/u-root/u-root/pkg/mount"
+	"github.com/u-root/u-root/pkg/mount/block"
 )
 
 // TODO backward compatibility for BIOS mode with partition type 0xee
@@ -36,28 +37,22 @@ var debug = func(string, ...interface{}) {}
 // mountByGUID looks for a partition with the given GUID, and tries to mount it
 // in a subdirectory under the specified mount point. The subdirectory has the
 // same name of the device (e.g. /your/base/mountpoint/sda1).
-// The specified filesystems will be used in the mount attempts.
 // If more than one partition is found with the given GUID, the first that is
 // found is used.
-// This function returns a storage.Mountpoint object, or an error if any.
-func mountByGUID(devices []storage.BlockDev, filesystems []string, guid, baseMountpoint string) (*storage.Mountpoint, error) {
+// This function returns a mount.Mountpoint object, or an error if any.
+func mountByGUID(devices block.BlockDevices, guid, baseMountpoint string) (*mount.MountPoint, error) {
 	log.Printf("Looking for partition with GUID %s", guid)
-	partitions, err := storage.PartitionsByGUID(devices, guid)
-	if err != nil || len(partitions) == 0 {
-		return nil, fmt.Errorf("Error looking up for partition with GUID %s", guid)
+	partitions := devices.FilterPartType(guid)
+	if len(partitions) == 0 {
+		return nil, fmt.Errorf("no partitions with GUID %s", guid)
 	}
 	log.Printf("Partitions with GUID %s: %+v", guid, partitions)
 	if len(partitions) > 1 {
 		log.Printf("Warning: more than one partition found with the given GUID. Using the first one")
 	}
-	dev := partitions[0]
-	mountpath := path.Join(baseMountpoint, dev.Name)
-	devname := path.Join("/dev", dev.Name)
-	mountpoint, err := storage.Mount(devname, mountpath, filesystems)
-	if err != nil {
-		return nil, fmt.Errorf("mountByGUID: cannot mount %s (GUID %s) on %s: %v", devname, guid, mountpath, err)
-	}
-	return mountpoint, nil
+
+	mountpath := filepath.Join(baseMountpoint, partitions[0].Name)
+	return partitions[0].Mount(mountpath, mount.MS_RDONLY)
 }
 
 // BootGrubMode tries to boot a kernel in GRUB mode. GRUB mode means:
@@ -68,7 +63,7 @@ func mountByGUID(devices []storage.BlockDev, filesystems []string, guid, baseMou
 // * build a list of valid boot configurations from the found GRUB configuration files
 // * try to boot every valid boot configuration until one succeeds
 //
-// The first parameter, `devices` is a list of storage.BlockDev . The function
+// The first parameter, `devices` is a list of block.BlockDev . The function
 // will look for bootable configurations on these devices
 // The second parameter, `baseMountPoint`, is the directory where the mount
 // points for each device will be created.
@@ -77,47 +72,40 @@ func mountByGUID(devices []storage.BlockDev, filesystems []string, guid, baseMou
 // instead.
 // The fourth parameter, `dryrun`, will not boot the found configurations if set
 // to true.
-func BootGrubMode(devices []storage.BlockDev, baseMountpoint string, guid string, dryrun bool, configIdx int) error {
-	// get a list of supported file systems for real devices (i.e. skip nodev)
-	debug("Getting list of supported filesystems")
-	filesystems, err := storage.GetSupportedFilesystems()
-	if err != nil {
-		log.Fatal(err)
-	}
-	debug("Supported file systems: %v", filesystems)
-
-	var mounted []storage.Mountpoint
+func BootGrubMode(devices block.BlockDevices, baseMountpoint string, guid string, dryrun bool, configIdx int) error {
+	var mounted []*mount.MountPoint
 	if guid == "" {
 		// try mounting all the available devices, with all the supported file
 		// systems
 		debug("trying to mount all the available block devices with all the supported file system types")
-		mounted = make([]storage.Mountpoint, 0)
 		for _, dev := range devices {
-			devname := path.Join("/dev", dev.Name)
-			mountpath := path.Join(baseMountpoint, dev.Name)
-			if mountpoint, err := storage.Mount(devname, mountpath, filesystems); err != nil {
-				debug("Failed to mount %s on %s: %v", devname, mountpath, err)
+			mountpath := filepath.Join(baseMountpoint, dev.Name)
+			if mountpoint, err := dev.Mount(mountpath, mount.MS_RDONLY); err != nil {
+				debug("Failed to mount %s on %s: %v", dev, mountpath, err)
 			} else {
-				mounted = append(mounted, *mountpoint)
+				mounted = append(mounted, mountpoint)
 			}
 		}
-		log.Printf("mounted: %+v", mounted)
-		defer func() {
-			// clean up
-			for _, mountpoint := range mounted {
-				syscall.Unmount(mountpoint.Path, syscall.MNT_DETACH)
-			}
-		}()
 	} else {
-		mount, err := mountByGUID(devices, filesystems, guid, baseMountpoint)
+		mount, err := mountByGUID(devices, guid, baseMountpoint)
 		if err != nil {
 			return err
 		}
-		mounted = []storage.Mountpoint{*mount}
+		mounted = append(mounted, mount)
 	}
 
+	log.Printf("mounted: %+v", mounted)
+	defer func() {
+		// clean up
+		for _, mountpoint := range mounted {
+			if err := mountpoint.Unmount(mount.MNT_DETACH); err != nil {
+				debug("Failed to unmount %v: %v", mountpoint, err)
+			}
+		}
+	}()
+
 	// search for a valid grub config and extracts the boot configuration
-	bootconfigs := make([]bootconfig.BootConfig, 0)
+	bootconfigs := make([]jsonboot.BootConfig, 0)
 	for _, mountpoint := range mounted {
 		bootconfigs = append(bootconfigs, ScanGrubConfigs(devices, mountpoint.Path)...)
 	}
@@ -172,29 +160,22 @@ func BootGrubMode(devices []storage.BlockDev, baseMountpoint string, guid string
 // * look for the kernel and initramfs in the provided locations
 // * boot the kernel with the provided command line
 //
-// The first parameter, `devices` is a list of storage.BlockDev . The function
+// The first parameter, `devices` is a list of block.BlockDev . The function
 // will look for bootable configurations on these devices
 // The second parameter, `baseMountPoint`, is the directory where the mount
 // points for each device will be created.
 // The third parameter, `guid`, is the partition GUID to look for.
 // The fourth parameter, `dryrun`, will not boot the found configurations if set
 // to true.
-func BootPathMode(devices []storage.BlockDev, baseMountpoint string, guid string, dryrun bool) error {
-	debug("Getting list of supported filesystems")
-	filesystems, err := storage.GetSupportedFilesystems()
-	if err != nil {
-		log.Fatal(err)
-	}
-	debug("Supported file systems: %v", filesystems)
-
-	mount, err := mountByGUID(devices, filesystems, guid, baseMountpoint)
+func BootPathMode(devices block.BlockDevices, baseMountpoint string, guid string, dryrun bool) error {
+	mount, err := mountByGUID(devices, guid, baseMountpoint)
 	if err != nil {
 		return err
 	}
 
 	fullKernelPath := path.Join(mount.Path, *flagKernelPath)
 	fullInitramfsPath := path.Join(mount.Path, *flagInitramfsPath)
-	cfg := bootconfig.BootConfig{
+	cfg := jsonboot.BootConfig{
 		Kernel:     fullKernelPath,
 		Initramfs:  fullInitramfsPath,
 		KernelArgs: *flagKernelCmdline,
@@ -220,7 +201,7 @@ func main() {
 	}
 
 	// Get all the available block devices
-	devices, err := storage.GetBlockStats()
+	devices, err := block.GetBlockDevices()
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -228,7 +209,7 @@ func main() {
 	if *flagDebug {
 		for _, dev := range devices {
 			log.Printf("Device: %+v", dev)
-			table, err := storage.GetGPTTable(dev)
+			table, err := dev.GPTTable()
 			if err != nil {
 				continue
 			}
@@ -242,7 +223,7 @@ func main() {
 		}
 	}
 
-	// TODO boot from EFI system partitions. See storage.FilterEFISystemPartitions
+	// TODO boot from EFI system partitions.
 
 	if *flagGrubMode {
 		if err := BootGrubMode(devices, *flagBaseMountPoint, *flagDeviceGUID, *flagDryRun, *flagConfigIdx); err != nil {

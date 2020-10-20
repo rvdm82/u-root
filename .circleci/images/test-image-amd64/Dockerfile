@@ -2,7 +2,7 @@
 # Use of this source code is governed by a BSD-style
 # license that can be found in the LICENSE file.
 
-FROM circleci/golang:1.12
+FROM circleci/golang:1.13
 
 # Install dependencies
 RUN sudo apt-get update &&                          \
@@ -19,8 +19,8 @@ RUN sudo apt-get update &&                          \
         libfdt-dev                                  \
         libpixman-1-dev                             \
         zlib1g-dev                                  \
-	libcap-dev                                  \
-	libattr1-dev                                \
+        libcap-dev                                  \
+        libattr1-dev                                \
         `# Linux kernel build deps`                 \
         libelf-dev                                  \
         `# Multiboot kernel build deps`             \
@@ -38,6 +38,7 @@ RUN set -eux;                                                             \
     sudo chmod 0444 .config;                                              \
     mv .config linux/;                                                    \
     cd linux;                                                             \
+    make olddefconfig;                                                    \
     make -j$(($(nproc) * 2 + 1));                                         \
     cd ~;                                                                 \
     cp linux/arch/x86_64/boot/bzImage bzImage;                            \
@@ -45,7 +46,7 @@ RUN set -eux;                                                             \
 
 # Build QEMU
 RUN set -eux;                                                          \
-    git clone --depth=1 --branch=v2.12.0 https://github.com/qemu/qemu; \
+    git clone --depth=1 --branch=v4.2.0 https://github.com/qemu/qemu;  \
     cd qemu;                                                           \
     mkdir build;                                                       \
     cd build;                                                          \
